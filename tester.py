@@ -123,24 +123,20 @@ if __name__ == '__main__':
     embedding = Activation('relu')(embedding)
     
     
-    # Set model-specific variables and get output layer
+    # Set model-specific variables and get prediction layer
     model_type = args.model_type
     model_depth = args.depth
-    
-    custom_loss_layer = None
-        
+            
     if model_type == ACT_KEYWORD:
         weight_dirname = "./act/"
         
-       # Should eventually be CalculateACTLoss (requires override of "call" fn with states returned)
-        custom_loss_layer = loss_layers.CalculateNormalXEntropyLoss
-
-        out_layer = act.ACT_Cell(hidden_dim, output_units=output_dim, 
+        out_layers = act.ACT_Cell(hidden_dim, output_units=output_dim, 
                                         max_computation_iters=model_depth,
                                         dropout=input_dropout, 
                                         recurrent_dropout=rec_dropout)(embedding)
-                
-                
+        out_layer, final_hidden_s, counters, remainders = out_layers
+        
+        
     elif model_type == RHN_KEYWORD:
         weight_dirname = "./rhn/"
         
@@ -168,26 +164,39 @@ if __name__ == '__main__':
         out_layer = Dense(output_dim)(out_layer)
         
         
-    # Get prediction, compile, and set-up inputs and outputs
+    # Get predictions, compile model, and set-up inputs and outputs
     predictions = Activation('softmax', name="predictions")(out_layer)
     
-    num_examples = X_train.shape[0]    
+    num_examples = X_train.shape[0] 
     if model_type in CUSTOM_LOSS_LAYERS:
-        final_loss = custom_loss_layer(name="loss_val")([true_output, predictions])
+        # Set custom loss layer and loss input list
+        custom_loss_layer = None
+
+        if model_type == ACT_KEYWORD:        
+            custom_loss_layer = loss_layers.CalculateACTLoss
+            loss_input = [ true_output, predictions, counters, remainders ]
+            
+        else:
+            raise ValueError("This model type has not defined its custom loss function.")            
+            
+        final_loss = custom_loss_layer(name="loss_val")(loss_input)
     
+        # Model definition and compilation
         model = Model([input, true_output], final_loss)
         model.compile(loss=(lambda y_true, y_pred: y_pred), optimizer='adam')
         
+        # Input/output values
         inputs = [ X_train, y_train ]
         output = np.random.random((num_examples, 1))
         
     else:
+        # Model definition and compilation
         model = Model(input, predictions)
         model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])        
 
+        # Input/output values
         inputs = [ X_train ]
         output = y_train
-        
         
         
     # Print model summary
@@ -203,17 +212,17 @@ if __name__ == '__main__':
         weight_path = weight_dirname + "weights-imdb-" + model_type + "-"
         weight_path += (str(input_dropout) + "-" + str(rec_dropout) + 
                             "-" + str(model_depth) + "-" + str(input_dim) +
-                            "-" + str(hidden_dim) + str(num_epochs) + 
-                            ".hdf5.alt")
+                            "-" + str(hidden_dim) + "-" + str(num_epochs) + 
+                            ".hdf5")
         
-        print(weight_path)
+        print(weight_path + "\n")
         callbacks.append(ModelCheckpoint(weight_path, 
                             monitor="loss", period=int(num_epochs),
                             save_best_only=False, save_weights_only=True))
 
     
     # Conduct training
-    batch_size = 32
+    batch_size = 96
     percent_val = 1.0
     
     train_subsection_i = int(batch_size * ((num_examples * percent_val) // batch_size))
@@ -229,8 +238,8 @@ if __name__ == '__main__':
     new_model = Model(inputs=model.inputs[0], outputs=pred_layer.output)
     new_model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
 
-    print("\n")
-    scores = new_model.evaluate(X_test, y_test, verbose=1)
+    print("\nEvaluation...\n")
+    scores = new_model.evaluate(X_test, y_test, batch_size=batch_size, verbose=1)
     print("Accuracy: %.2f%%" % (scores[1] * 100))
     
     

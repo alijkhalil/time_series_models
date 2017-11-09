@@ -28,7 +28,7 @@ from dl_utilities.layers import general as dl_layers
 # Global variables
 DEFAULT_EPSILON=0.005
 DEFAULT_MAX_ITERS=5
-DEFAULT_PONDER_COST=0.001
+DEFAULT_PONDER_COST=1E-5
 DEFAULT_WEIGHT_DECAY=1E-4
 
 
@@ -45,13 +45,14 @@ class ACT_Cell(Recurrent):
     # Issues:
         -Keras does not have a backend function for looping based on a predicate
             -must be done with a custom function for desired backend framework(s)
-            -without this, the ACT cell does not have the ability to stop training early for easy examples
+            -without this, the ACT does not have the ability to stop training early (for easy examples)
         -Instability of training RNN's on Keras
-            -particular with high dropout rate
-        -Due to previously mentioned issues, current implementation does not include ponder cost
-            -must resolve other issues before addressing this one
-            -logic exists though using the "CalculateACTLoss" layer in the "dl_utilities" repo
-            -even without the ponder cost loss, model will learn weights for states at each iteration
+            -particularly with high dropout rate
+        -Due to previously mentioned issues, current implementation does not include heavy ponder cost (PC)
+            -intentionally kept PC low since ACT cannot stop computation early (without a forloop on the backend)
+            -largely marginalizes the benefit of an ACT cell
+                -however this model is still good as a proof-of-concept until looping is incorporated
+                -aside from not being time efficient, the model logically functions exactly like the original ACT
         
     # Arguments
         output_units: Positive integer, dimensionality of the hidden state space.
@@ -134,13 +135,12 @@ class ACT_Cell(Recurrent):
                  dropout=0.,
                  recurrent_dropout=0.,
                  **kwargs):
-                 
-                 
+         
         super(ACT_Cell, self).__init__(**kwargs)
         
         if output_units is None:
             raise ValueError("The 'output_units' variable must be an integer.")
-            
+                
         self.hidden_units = hidden_units
         self.output_units = output_units
         
@@ -169,9 +169,81 @@ class ACT_Cell(Recurrent):
         self.recurrent_dropout = min(1., max(0., recurrent_dropout))
         
         self.internal_layers = {}
+        self.return_state = True
 
         
-    # Function override to ensure that it is never called in this type of recurrent layer
+    # Override to ensure that implementation does rely on Keras to have 'return_states' support
+    def call(self, inputs, mask=None, initial_state=None, training=None):
+        if initial_state is not None:
+            if not isinstance(initial_state, (list, tuple)):
+                initial_states = [initial_state]
+            else:
+                initial_states = list(initial_state)
+                
+        if isinstance(inputs, list):
+            initial_states = inputs[1:]
+            inputs = inputs[0]
+        elif self.stateful:
+            initial_states = self.states
+        else:
+            initial_states = self.get_initial_state(inputs)
+
+        if len(initial_states) != len(self.states):
+            raise ValueError('Layer has ' + str(len(self.states)) +
+                             ' states but was passed ' +
+                             str(len(initial_states)) +
+                             ' initial states.')
+                             
+        input_shape = K.int_shape(inputs)
+        if self.unroll and input_shape[1] is None:
+            raise ValueError('Cannot unroll a RNN if the '
+                             'time dimension is undefined. \n'
+                             '- If using a Sequential model, '
+                             'specify the time dimension by passing '
+                             'an `input_shape` or `batch_input_shape` '
+                             'argument to your first layer. If your '
+                             'first layer is an Embedding, you can '
+                             'also use the `input_length` argument.\n'
+                             '- If using the functional API, specify '
+                             'the time dimension by passing a `shape` '
+                             'or `batch_shape` argument to your Input layer.')
+                             
+        constants = self.get_constants(inputs, training=None)
+        preprocessed_input = self.preprocess_input(inputs, training=None)
+        last_output, outputs, states = K.rnn(self.step,
+                                             preprocessed_input,
+                                             initial_states,
+                                             go_backwards=self.go_backwards,
+                                             mask=mask,
+                                             constants=constants,
+                                             unroll=self.unroll,
+                                             input_length=input_shape[1])
+                                             
+        if self.stateful:
+            updates = []
+            for i in range(len(states)):
+                updates.append((self.states[i], states[i]))
+            self.add_update(updates, inputs)
+
+        if self.return_sequences:
+            output = outputs
+        else:
+            output = last_output
+
+        # Properly set learning phase
+        if getattr(last_output, '_uses_learning_phase', False):
+            output._uses_learning_phase = True
+
+        if not isinstance(states, (list, tuple)):
+            states = [states]
+        else:
+            states = list(states)
+            
+        # Return output and states combined (in a list)    
+        return [output] + states
+
+    
+    # No suppport for "add_weight" - instead use higher-level Layers and "add_layer" function
     def add_weight(self, shape, initializer,
                    name=None,
                    trainable=True,
@@ -179,8 +251,7 @@ class ACT_Cell(Recurrent):
                    constraint=None):
                    
         raise ValueError("The 'add_weight' function is not allowed for this " \
-                            "particular RNN layer. Use 'add_layer' function instead.")  
-                   
+                            "particular RNN layer. Use 'add_layer' function instead.")                 
     
     
     # Layer functions
@@ -219,10 +290,17 @@ class ACT_Cell(Recurrent):
             input_shape = input_shape[0]
             
         if self.return_sequences:
-            return (input_shape[0], input_shape[1], self.output_units)
+            output_shape = (input_shape[0], input_shape[1], self.output_units)
         else:
-            return (input_shape[0], self.output_units)
+            output_shape = (input_shape[0], self.output_units)
 
+        state_shape = [ ]
+        for i_spec in self.state_spec:
+            cur_dim = i_spec.shape[-1]
+            state_shape.append((input_shape[0], cur_dim))
+            
+        return [output_shape] + state_shape
+    
             
     def get_initial_state(self, inputs):
         # Build an all-zero tensor of shape (samples, 1)        
@@ -312,7 +390,6 @@ class ACT_Cell(Recurrent):
         GRU_input_shape = (batch_size, None, input_dim + 1)
         hidden_input_shape = (batch_size, self.hidden_units) 
         output_shape = (batch_size, self.hidden_units)                                        
-        
         
         # Set input dimension and spec values 
         self.input_dim = input_dim
@@ -428,6 +505,7 @@ class ACT_Cell(Recurrent):
 
         
     def step(self, inputs, states):
+        # Break down previous output/states
         s_tm1 = states[0]       # from states (returned below in order)
         init_counter = states[1]       # from states (returned below in order)
         init_remainder = states[2]       # from states (returned below in order)
@@ -436,16 +514,18 @@ class ACT_Cell(Recurrent):
         rec_dp_mask = states[4]		# from "get_constants"
 
         
-        # Input flag, counters, and constant tensors
+        # Input flag and counters
         new_input_flag = K.variable(1, dtype='int16')
-        
-        x_bin_init = concatenate([inputs, K.ones_like(init_counter)], axis=-1)        
-        x_bin_non_init = concatenate([inputs, K.zeros_like(init_counter)], axis=-1)
-        
-        counter = act_layers.ResetLayer()(init_counter)		
+
+        counter = act_layers.ResetLayer()(init_counter)
         prob = act_layers.ResetLayer()(init_remainder)
         prev_not_done_mask = act_layers.SetterLayer(1.0)(init_counter)
+
         
+        # Constants that can be generate on each iteration (in tf.while_loop) if needed
+        x_bin_init = concatenate([inputs, K.ones_like(init_counter)], axis=-1)        
+        x_bin_non_init = concatenate([inputs, K.zeros_like(init_counter)], axis=-1)
+                
         one_minus_eps = act_layers.SetterLayer(1.0 - self.eplison_val)(init_counter)
         max_computation = act_layers.SetterLayer(self.max_computation_iters)(init_counter)
         
@@ -458,7 +538,7 @@ class ACT_Cell(Recurrent):
             x_bin = act_layers.FlagLayer(new_input_flag)([x_bin_init, x_bin_non_init])
             
             layer_key_str = ("LN_layer%d" % (i + 1))
-            s_cur = self.get_layer(layer_key_str)(s_cur)            
+            s_cur = self.get_layer(layer_key_str)(s_cur)
             
             dp_hidden = s_cur * dp_mask[i]
             dp_rec_hidden = s_cur * rec_dp_mask[i]
