@@ -1,6 +1,7 @@
 # Import statements
 import sys
 import numpy as np
+import tensorflow as tf
 
 from keras import backend as K
 
@@ -26,10 +27,10 @@ from dl_utilities.layers import general as dl_layers
 
 
 # Global variables
-DEFAULT_EPSILON=0.005
-DEFAULT_MAX_ITERS=5
-DEFAULT_PONDER_COST=1E-5
-DEFAULT_WEIGHT_DECAY=1E-4
+DEFAULT_EPSILON=0.01
+DEFAULT_MAX_ITERS=25
+DEFAULT_PONDER_COST=5E-6
+
 
 
 # ACT Cell definition
@@ -44,15 +45,9 @@ class ACT_Cell(Recurrent):
     
     # Issues:
         -Keras does not have a backend function for looping based on a predicate
-            -must be done with a custom function for desired backend framework(s)
-            -without this, the ACT does not have the ability to stop training early (for easy examples)
+            -approximated using 'loop_layer' (from 'general' layers in the 'dl_utilities' repo)
         -Instability of training RNN's on Keras
             -particularly with high dropout rate
-        -Due to previously mentioned issues, current implementation does not include heavy ponder cost (PC)
-            -intentionally kept PC low since ACT cannot stop computation early (without a forloop on the backend)
-            -largely marginalizes the benefit of an ACT cell
-                -however this model is still good as a proof-of-concept until looping is incorporated
-                -aside from not being time efficient, the model logically functions exactly like the original ACT
         
     # Arguments
         output_units: Positive integer, dimensionality of the hidden state space.
@@ -435,13 +430,6 @@ class ACT_Cell(Recurrent):
                                     name='recurrent_kernel2')
                                  
         self.add_layer(recurrent_layer2, 'recurrent_layer2', hidden_input_shape)
-
-        for i in range(self.max_computation_iters):           
-            layer_key_str = ("LN_layer%d" % (i + 1))
-            LN_layer = dl_layers.LN(use_variance=False, name=layer_key_str)
-           
-            self.add_layer(LN_layer, layer_key_str, hidden_input_shape)
-
             
         output_layer = Dense((self.output_units + 1),
                                     use_bias=self.use_bias,
@@ -463,44 +451,34 @@ class ACT_Cell(Recurrent):
     def get_constants(self, inputs, training=None):
         constants = []
         
-        if 0.0 < self.dropout < 1.0:
-            ones = K.ones_like(K.reshape(inputs[:, 0, 0], (-1, 1)))
-            ones = K.tile(ones, (1, self.hidden_units))
+        # Set ones tensor with shape of hidden layer
+        ones = K.ones_like(K.reshape(inputs[:, 0, 0], (-1, 1)))
+        ones = K.tile(ones, (1, self.hidden_units))
+        
+        # Get input and recurrent dropout masks
+        if 0.0 < self.dropout < 1.0:            
+            dp_mask = K.in_train_phase(K.dropout(ones, self.dropout),
+                                            ones,
+                                            training=training)                                                
+                                            
+        else:
+            dp_mask = ones
+        
+        constants.append(dp_mask)
             
-            def dropped_inputs():
-                return K.dropout(ones, self.dropout)
-
-            dp_mask = [ K.in_train_phase(dropped_inputs,
+            
+        if 0 < self.recurrent_dropout < 1:            
+            rec_dp_mask = K.in_train_phase(K.dropout(ones, self.dropout),
                                             ones,
                                             training=training)
-                            for _ in range(self.max_computation_iters) ]
-                                                
-            constants.append(dp_mask)
-            
+                                            
         else:
-            dp_mask = [ K.cast_to_floatx(1.) for _ in range(self.max_computation_iters) ]
-            constants.append(dp_mask)
-            
-            
-        if 0 < self.recurrent_dropout < 1:
-            ones = K.ones_like(K.reshape(inputs[:, 0, 0], (-1, 1)))
-            ones = K.tile(ones, (1, self.hidden_units))
-            
-            def dropped_inputs():
-                return K.dropout(ones, self.recurrent_dropout)
-
-            rec_dp_mask = [ K.in_train_phase(dropped_inputs,
-                                            ones,
-                                            training=training)
-                            for _ in range(self.max_computation_iters) ]
+            rec_dp_mask = ones
                                                 
-            constants.append(rec_dp_mask)
-            
-        else:
-            rec_dp_mask = [ K.cast_to_floatx(1.) for _ in range(self.max_computation_iters) ]
-            constants.append(rec_dp_mask)
-
-            
+        constants.append(rec_dp_mask)
+        
+        
+        # Return them        
         return constants
 
         
@@ -515,33 +493,51 @@ class ACT_Cell(Recurrent):
 
         
         # Input flag and counters
-        new_input_flag = K.variable(1, dtype='int16')
+        new_input_flag = K.variable(1, dtype='float32')
 
         counter = act_layers.ResetLayer()(init_counter)
+        counter_condition = act_layers.SetterLayer(1.0)(init_counter)
+
         prob = act_layers.ResetLayer()(init_remainder)
         prev_not_done_mask = act_layers.SetterLayer(1.0)(init_counter)
 
-        
-        # Constants that can be generate on each iteration (in tf.while_loop) if needed
-        x_bin_init = concatenate([inputs, K.ones_like(init_counter)], axis=-1)        
-        x_bin_non_init = concatenate([inputs, K.zeros_like(init_counter)], axis=-1)
-                
-        one_minus_eps = act_layers.SetterLayer(1.0 - self.eplison_val)(init_counter)
-        max_computation = act_layers.SetterLayer(self.max_computation_iters)(init_counter)
-        
-        
-        # For loop with core functionality
         s_cur = s_tm1
+        acclum_state = act_layers.ResetLayer()(s_tm1)
+        acclum_output = act_layers.CreateCustomShapeLayer(self.output_units)(inputs)
         
-        for i in range(self.max_computation_iters): 
+        
+        # Define loop condition and step functions
+        def cond_func(inputs, new_input_flag, acclum_output, 
+                        s_cur, acclum_state,
+                        prob, counter, counter_condition,
+                        dp_mask, rec_dp_mask, not_done_mask):
+            
+            final_cond = multiply([not_done_mask, counter_condition])
+            return K.any(final_cond)
+        
+        
+        def step_func(inputs, new_input_flag, acclum_output, 
+                        s_cur, acclum_state,
+                        prob, counter, counter_condition,
+                        dp_mask, rec_dp_mask, not_done_mask):
+                        
+            # Constants that can be generate on each iteration (in tf.while_loop) if needed
+            x_bin_init = concatenate([inputs, K.ones_like(counter)], axis=-1)        
+            x_bin_non_init = concatenate([inputs, K.zeros_like(counter)], axis=-1)
+                    
+            one_minus_eps = act_layers.SetterLayer(1.0 - self.eplison_val)(counter)
+            max_computation = act_layers.SetterLayer(self.max_computation_iters)(counter)
+            
+                    
             # Augment input with binary flag and pass input/hidden state to transition RNN
             x_bin = act_layers.FlagLayer(new_input_flag)([x_bin_init, x_bin_non_init])
             
-            layer_key_str = ("LN_layer%d" % (i + 1))
-            s_cur = self.get_layer(layer_key_str)(s_cur)
             
-            dp_hidden = s_cur * dp_mask[i]
-            dp_rec_hidden = s_cur * rec_dp_mask[i]
+            # Normalize hidden state (with zero mean) and then apply dropout to it (during training)
+            s_cur = s_cur - K.mean(s_cur, [1], keepdims=True)
+            dp_hidden = s_cur * dp_mask
+            dp_rec_hidden = s_cur * rec_dp_mask
+                        
                         
             # GRU logic (for recursively mixing state with input)
             matrix_x = self.get_layer('input_layer')(x_bin)
@@ -572,7 +568,7 @@ class ACT_Cell(Recurrent):
             # Determine if batch items are done yet to update running probability
             tmp_probs = add([prob, new_percent])
             less_than_limit = act_layers.CompLayer()([tmp_probs, one_minus_eps])
-            new_not_done_mask = multiply([less_than_limit, prev_not_done_mask])
+            new_not_done_mask = multiply([less_than_limit, not_done_mask])
             
             add_vals = multiply([new_percent, new_not_done_mask])
             prob = add([prob, add_vals])
@@ -588,20 +584,16 @@ class ACT_Cell(Recurrent):
             final_iter_remainder_condition = act_layers.OneMinusLayer()(final_iter_prob_condition)
             
 
-            # If percentage does not pass one_minus_ep threshold, then use "new_percent", otherwise use prob remainder
+            # If percentage less than one_minus_ep, use "new_percent", otherwise use prob remainder
             prob_weights = multiply([final_iter_prob_condition, new_percent])
             remainder_weights = multiply([final_iter_remainder_condition, 
                                             act_layers.OneMinusLayer()(prob)])
             
             culm_update_weights = add([prob_weights, remainder_weights])
-            culm_update_weights = multiply([culm_update_weights, prev_not_done_mask])
+            culm_update_weights = multiply([culm_update_weights, not_done_mask])
             
             
             # Set accumulated values by adding weighted amount onto previous accumulated value
-            if i == 0:
-                acclum_state = act_layers.ResetLayer()(s_tm1)
-                acclum_output = act_layers.ResetLayer()(output)
-
             new_s_term = multiply([culm_update_weights, s_cur])
             acclum_state = add([acclum_state, new_s_term])
             
@@ -611,16 +603,32 @@ class ACT_Cell(Recurrent):
                
             # Set input flag and done mask variables
             s_cur = s_next
-            prev_not_done_mask = new_not_done_mask
+            not_done_mask = new_not_done_mask
             new_input_flag = act_layers.ResetLayer()(new_input_flag)
 
         
+            return [inputs, new_input_flag, acclum_output, s_cur, acclum_state, 
+                        prob, counter, counter_condition, dp_mask, rec_dp_mask, 
+                        not_done_mask]
+        
+        
+        # Call loop layer
+        looper = dl_layers.loop_layer(cond_func, step_func)
+        loop_inputs = [ inputs, new_input_flag, acclum_output, 
+                        s_cur, acclum_state,
+                        prob, counter, counter_condition,
+                        dp_mask, rec_dp_mask,
+                        prev_not_done_mask ]
+        
+        acclum_output, acclum_state, prob, counter = looper(loop_inputs)
+
+        
         # Get accumulated counter and remainder values
-        new_counter = act_layers.MultiplyByScalar(self.ponder_cost)(counter)
+        new_counter = K.cast_to_floatx(self.ponder_cost) * counter
         new_counter = add([init_counter, new_counter])
         
-        new_remainders = act_layers.OneMinusLayer()(prob)
-        new_remainders = act_layers.MultiplyByScalar(self.ponder_cost)(new_remainders)        
+        new_remainders = K.cast_to_floatx(1.) - prob
+        new_remainders = K.cast_to_floatx(self.ponder_cost) * new_remainders        
         new_remainders = add([init_remainder, new_remainders])
         
         
