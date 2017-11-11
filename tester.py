@@ -34,6 +34,7 @@ CUSTOM_RHN_KEYWORD='custom_rhn'
 GRU_KEYWORD='stacked_gru'
 
 CUSTOM_LOSS_LAYERS = [ACT_KEYWORD]
+DEFAULT_WEIGHT_DECAY=1E-4
 
 
 
@@ -57,7 +58,7 @@ if __name__ == '__main__':
                             help='apply dropout to embedding input of model at this rate (flag alone defaults to 0.1)')
     parser.add_argument('--recurrent_dropout', nargs='?', default=0.0, const=0.25, type=float, metavar='recurrent_dropout',
                             help='apply dropout recurrent hidden state at this rate (flag alone defaults to 0.25)')                            
-    parser.add_argument('--depth', nargs='?', default=5, const=5, type=int, metavar='depth',
+    parser.add_argument('--depth', nargs='?', default=6, const=6, type=int, metavar='depth',
                             help='maximum depth of each time step in RNN (no flag defaults to 5)')
     parser.add_argument('--input_dim', nargs='?', default=128, const=128, type=int, metavar='input_dim',
                             help='dimensionality of the input embeddings to the RNN (no flag defaults to 128)')
@@ -118,8 +119,8 @@ if __name__ == '__main__':
     embedding_vecor_length = input_dim
     embedding = Embedding(top_words, embedding_vecor_length, 
                             input_length=max_review_length)(input)
-    embedding = BatchNormalization(axis=-1, gamma_regularizer=l2(1E-4), 
-                            beta_regularizer=l2(1E-4))(embedding)
+    embedding = BatchNormalization(axis=-1, gamma_regularizer=l2(DEFAULT_WEIGHT_DECAY), 
+                                    beta_regularizer=l2(DEFAULT_WEIGHT_DECAY))(embedding)
     embedding = Activation('relu')(embedding)
     
     
@@ -131,7 +132,6 @@ if __name__ == '__main__':
         weight_dirname = "./act/"
         
         out_layers = act.ACT_Cell(hidden_dim, output_units=output_dim, 
-                                        max_computation_iters=model_depth,
                                         dropout=input_dropout, 
                                         recurrent_dropout=rec_dropout)(embedding)
         out_layer, final_hidden_s, counters, remainders = out_layers
