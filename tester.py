@@ -222,7 +222,7 @@ if __name__ == '__main__':
 
     
     # Conduct training
-    batch_size = 96
+    batch_size = 64
     percent_val = 1.0
     
     train_subsection_i = int(batch_size * ((num_examples * percent_val) // batch_size))

@@ -29,7 +29,7 @@ from dl_utilities.layers import general as dl_layers
 # Global variables
 DEFAULT_EPSILON=0.01
 DEFAULT_MAX_ITERS=25
-DEFAULT_PONDER_COST=5E-6
+DEFAULT_PONDER_COST=1E-7
 
 
 
