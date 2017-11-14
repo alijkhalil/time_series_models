@@ -1,144 +1,201 @@
-# IMDB dataset
-# requires tranformation in character-wise dataset
-# can be using:
-#    from keras.datasets import imdb
-#    imdb.get_word_index(path='imdb_word_index.json'):
+from __future__ import print_function
+from __future__ import absolute_import
+from __future__ import division
 
-# Overall model would:
-#   -parse dataset into words
-#   -parse words into character embeddings
-#   -insert following tokens:
-#           -spaces tokens between words
-#           -start sequence token 
-#           -UNK sequence token for OVV words
-#               -EITHER of a certain "normal" word len or do it per actual character 
-#               -agruments:
-#                  -would be providing extra info (e.g. word length)
-#                   -word/char not directly comparable either way
-#   -DOES DATA HAVE SPECIAL MARKER FOR PERIODS, COMMAS, ETC
-#
-#   When tested with old recurrent RNNs
-#       -function to convert char embedding into N-grams to make word embeddings
-#       -link:  https://arxiv.org/pdf/1508.06615.pdf
-#
-#   Model
-#       -make char embedding or maybe just take the straight number
-#           -how would it work with char embeddings? don't think it would!
-#       -pass into wavenet model and process
+import warnings, math
+
+import keras.backend as K
+
+from keras import metrics
+from keras.callbacks import ModelCheckpoint
+from keras.datasets import imdb
+from keras.preprocessing import sequence
+from keras.utils import to_categorical
+
+from keras.models import Model
+from keras.layers import Input, Conv1D, Dense, Flatten
+from keras.layers import add, multiply, concatenate
+from keras.layers.embeddings import Embedding
+from keras.layers.normalization import BatchNormalization
+from keras.regularizers import l2
+from keras.layers.core import Activation
 
 
-# Look at: https://github.com/usernaamee/keras-wavenet/blob/master/simple-generative-model-regressor.py
-#       -generative version very similar to regressive in implementation
-#       -should be the same
-#           -generative used for Text-To-Speech, music generation
-#           -regressor used for prediction of next audio waves
-
-# Consider differences with ByteNet
-#       -operates on character
-#       -translator uses encoder/decoder framework
-#       -Generator uses only decoder
-#
-#       -Encoder can take context too 
-#       -Casual mask done on decoder
-#           -But also takes last token (via addition) too
+DEFAULT_WEIGHT_DECAY=1E-4
 
 
-# Replaced by "Conv1D" with "dilation_rate" parameter
-# Should be kwargs['dilation_rate'] = rate (e.g. atrous_rate)
-# atrous_rate is distance between nodes in the filter (should be exponent of 2)
-class CausalAtrousConvolution1D(AtrousConvolution1D):
-    def __init__(self, nb_filter, filter_length, init='glorot_uniform', activation=None, weights=None,
-                 border_mode='valid', subsample_length=1, atrous_rate=1, W_regularizer=None, b_regularizer=None,
-                 activity_regularizer=None, W_constraint=None, b_constraint=None, bias=True, causal=False, **kwargs):
-        
-        super(CausalAtrousConvolution1D, self).__init__(nb_filter, filter_length, init, activation, weights,
-                                                        border_mode, subsample_length, atrous_rate, W_regularizer,
-                                                        b_regularizer, activity_regularizer, W_constraint, b_constraint,
-                                                        bias, **kwargs)
-        self.causal = causal
-        if self.causal and border_mode != 'valid':
-            raise ValueError("Causal mode dictates border_mode=valid.")
-
-    def get_output_shape_for(self, input_shape):
-        input_length = input_shape[1]
-
-        if self.causal:
-            input_length += self.atrous_rate * (self.filter_length - 1)
-
-        # def conv_output_length(input_length, filter_size,
-        #                           padding, stride, dilation=1):
-        length = conv_output_length(input_length,
-                                    self.filter_length,
-                                    self.border_mode,
-                                    self.subsample[0],  # Should just be baked in as stride of 1
-                                    dilation=self.atrous_rate)
-
-        return (input_shape[0], length, self.nb_filter)
-
-    def call(self, x, mask=None):
-        # For prepending input with padding (on one side)
-        if self.causal:
-            x = K.asymmetric_temporal_padding(x, self.atrous_rate * (self.filter_length - 1), 0)
-        
-        # No mask parameter in call
-        # May need to mask out prior... WITH WHAT FUNCTION TO GENERATE THE MASK?
-        #                                Make my own layer to pass it through
-        return super(CausalAtrousConvolution1D, self).call(x, mask)
-
-
-def WaveNet(fragment_length, nb_filters, nb_output_bins, dilation_depth, nb_stacks, use_skip_connections,
-                learn_all_outputs, _log, desired_sample_rate, use_bias, res_l2, final_l2):
-    def residual_block(x):
-        original_x = x
-        
-        # Note: The AtrousConvolution1D with the 'causal' flag is implemented in github.com/basveeling/keras#@wavenet.
-        tanh_out = CausalAtrousConvolution1D(nb_filters, 2, atrous_rate=2 ** i, border_mode='valid', causal=True,
-                                             bias=use_bias,
-                                             name='dilated_conv_%d_tanh_s%d' % (2 ** i, s), activation='tanh',
-                                             W_regularizer=l2(res_l2))(x)
-        sigm_out = CausalAtrousConvolution1D(nb_filters, 2, atrous_rate=2 ** i, border_mode='valid', causal=True,
-                                             bias=use_bias,
-                                             name='dilated_conv_%d_sigm_s%d' % (2 ** i, s), activation='sigmoid',
-                                             W_regularizer=l2(res_l2))(x)
-        x = layers.Merge(mode='mul', name='gated_activation_%d_s%d' % (i, s))([tanh_out, sigm_out])
-
-        res_x = layers.Convolution1D(nb_filters, 1, border_mode='same', bias=use_bias,
-                                     W_regularizer=l2(res_l2))(x)
-        skip_x = layers.Convolution1D(nb_filters, 1, border_mode='same', bias=use_bias,
-                                      W_regularizer=l2(res_l2))(x)
-                                      
-        res_x = layers.Merge(mode='sum')([original_x, res_x])
-        return res_x, skip_x
+def WaveNetBlock(new_filters, filter_size, dilation_rate, 
+                    use_BN=False, multi_context=False, regressor=False):
+    def func(x):
+        input = Activation('relu')(x)
+        input_dim = K.int_shape(x)[-1]
         
         
+        # Set necessary WaveNet block parameters
+        if regressor:
+            padding='causal'
+        else:
+            padding='same'
+            
+        if multi_context:
+            num_iter = 3
+        else:
+            num_iter = 1
+
+            
+        # Get needed residual layers
+        combined_layers = []    
+        for i in range(num_iter):
+            tanh_out = Conv1D(new_filters, (filter_size + (i * 2)),
+                                           padding=padding,
+                                           dilation_rate=dilation_rate,
+                                           activation='tanh')(input)
+                                           
+            sigmoid_out = Conv1D(new_filters, (filter_size + (i * 2)),
+                                            padding=padding,
+                                            dilation_rate=dilation_rate,
+                                            activation='sigmoid')(input)
+                                          
+            combined = multiply([tanh_out, sigmoid_out])
+            combined_layers.append(combined)
         
-    input = Input(shape=(fragment_length, nb_output_bins), name='input_part')
-    out = input
-    skip_connections = []
-    out = CausalAtrousConvolution1D(nb_filters, 2, atrous_rate=1, border_mode='valid', causal=True,
-                                    name='initial_causal_conv')(out)
-    for s in range(nb_stacks):
-        for i in range(0, dilation_depth + 1):
-            out, skip_out = residual_block(out)
-            skip_connections.append(skip_out)
+        if multi_context:
+            final_combined = concatenate(combined_layers)
+        else:
+            final_combined = combined_layers[0]
+            
+            
+        # Transform them to have "input_dim" filter so that they can be added as a residual    
+        skip_layer = Conv1D(input_dim, 1, padding='same')(final_combined)
+        skip_layer = BatchNormalization(axis=-1, epsilon=1E-5)(skip_layer)
+        
+        out_layer = add([input, skip_layer])
+        
+        
+        # Return both skip and output layer
+        return out_layer, skip_layer
+        
+    return func
 
-    if use_skip_connections:
-        out = layers.Merge(mode='sum')(skip_connections)
-    out = layers.Activation('relu')(out)
-    out = layers.Convolution1D(nb_output_bins, 1, border_mode='same',
-                               W_regularizer=l2(final_l2))(out)
-    out = layers.Activation('relu')(out)
-    out = layers.Convolution1D(nb_output_bins, 1, border_mode='same')(out)
+    
+def WaveNet(input_tensor, output_dim, skip_filters=64, 
+                dilation_steps=6, dilation_blocks=3, final_activation='softmax',
+                use_BN=False, multi_context=False, regressor=False):
+                
+    # Ensure that input into Keras tensor
+    if not K.is_keras_tensor(input_tensor):
+        raise ValueError('WaveNet model requires a Keras tensor as an input.')
+    
+    # Input should ideally have final dimension of 1
+    input = input_tensor
+    input_dim = K.int_shape(input)[-1]    
+    
+    if input_dim > 1:
+        warnings.warn('The input layer to a WaveNet model should typically have a '
+                              'dimensionality of 1.\nThis recurrent model is designed to '
+                              'discern long-term dependencies on scalar, high-resolution inputs.\n' 
+                              'While it accepts inputs with a higher dimensionality, it is likely\n'
+                              'that this model is sub-optimal for this particular problem.')
+                
+    # Set parameters rated to filter size and dilation
+    init_filter_size=2
+    init_dilation_rate=2
 
-    if not learn_all_outputs:
-        raise DeprecationWarning('Learning on just all outputs is wasteful, now learning only inside receptive field.')
-        out = layers.Lambda(lambda x: x[:, -1, :], output_shape=(out._keras_shape[-1],))(
-            out)  # Based on gif in deepmind blog: take last output?
+    def wavenet_dilation(cur_iter):
+        exponent_val=(1 + (cur_iter % dilation_steps))
+        return int(math.pow(init_dilation_rate, exponent_val))
+                
+                
+    # Begin processing input and feed through WaveNet dilation blocks
+    out, skip = WaveNetBlock(skip_filters, init_filter_size, 2,
+                                use_BN, multi_context, regressor)(input)
+    
+    skip_connections = [skip]
+    for i in range(1, (dilation_steps * dilation_blocks)):
+        out, skip = WaveNetBlock(skip_filters, init_filter_size, wavenet_dilation(i),
+                                    use_BN, multi_context, regressor)(out)
+                                    
+        skip_connections.append(skip)
+        
+        
+    # Sum all skip connections and get final output
+    out = add(skip_connections)
+    out = Activation('relu')(out)
+    out = Conv1D(input_dim, 1)(out)
+    out = BatchNormalization(axis=-1, epsilon=1E-5)(out)
+    out = Activation('relu')(out)    
+    out = Conv1D(input_dim, 1)(out)
+    out = Flatten()(out)
+    final_layer = Dense(output_dim, activation=final_activation)(out)
+    
+    
+    # Return the last layer with softmax values
+    return final_layer
 
-    out = layers.Activation('softmax', name="output_softmax")(out)
-    model = Model(input, out)
+    
+    
 
-    receptive_field, receptive_field_ms = compute_receptive_field()
+#############   MAIN ROUTINE   #############	
+if __name__ == '__main__':
+    # Model parameters    
+    time_steps=500
 
-    _log.info('Receptive Field: %d (%dms)' % (receptive_field, int(receptive_field_ms)))
-    return model        
+    input_dim=64
+    hidden_dim=256
+    output_dim=2
+
+
+    # Get IMDB training/test dataset
+    top_words = 5000
+    (X_train, y_train), (X_test, y_test) = imdb.load_data(num_words=top_words)
+
+
+    # Truncate and pad input sequences (depending on length)
+    max_review_length = time_steps
+    X_train = sequence.pad_sequences(X_train, maxlen=max_review_length)
+    X_test = sequence.pad_sequences(X_test, maxlen=max_review_length) 
+
+    y_train = to_categorical(y_train, output_dim)
+    y_test = to_categorical(y_test, output_dim)
+
+
+    # Set-up input embedding for all RNN models
+    input = Input((time_steps, ))
+    true_output = Input((output_dim, ))
+
+    embedding_vecor_length = input_dim
+    embedding = Embedding(top_words, embedding_vecor_length, 
+                            input_length=max_review_length)(input)
+    embedding = BatchNormalization(axis=-1, gamma_regularizer=l2(DEFAULT_WEIGHT_DECAY), 
+                                    beta_regularizer=l2(DEFAULT_WEIGHT_DECAY))(embedding)
+    
+    softmax_logits = WaveNet(embedding, output_dim, hidden_dim, 
+                                        dilation_steps=5, dilation_blocks=4, 
+                                        use_BN=False, multi_context=False, regressor=False)
+                            
+    # Define model
+    model = Model(inputs=input, outputs=softmax_logits)
+    model.compile(loss='categorical_crossentropy', optimizer='adam', 
+                        metrics=['accuracy'])
+    model.summary()
+    
+    
+    # Begin training
+    num_epochs=8
+    batch_size = 64
+    percent_val = 1.0
+    
+    num_examples = X_train.shape[0]
+    train_subsection_i = int(batch_size * ((num_examples * percent_val) // batch_size))
+    
+    model.fit(X_train[:train_subsection_i], y_train[:train_subsection_i], epochs=num_epochs, batch_size=batch_size)
+    
+    
+    # Evaluate at the end of training
+    print("\nEvaluation...\n")
+    scores = model.evaluate(X_test, y_test, batch_size=batch_size, verbose=1)
+    print("Accuracy: %.2f%%" % (scores[1] * 100))    
+    
+    
+    # Exit successfully
+    exit(0)  
