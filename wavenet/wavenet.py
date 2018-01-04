@@ -25,10 +25,15 @@ from keras.layers.core import Activation
 
 sys.path.append("..")
 from dl_utilities.datasets import dataset_utils as ds_utils
+from dl_utilities.general import general as gen_utils
 
 
 DEFAULT_WEIGHT_DECAY=1E-4
 DEFAULT_EPSILON=1E-5
+
+INIT_FILTER_SIZE=3
+RECUR_FILTER_SIZE=2
+DILATION_EXP_BASE=2
 
 
 '''
@@ -60,6 +65,9 @@ DEFAULT_EPSILON=1E-5
                 -useful for scenerios like music and pixel generation
                     where future output can only be conditioned on 
                     previous time steps
+                -in this case, training sequences can be trimmed down to 
+                    be the size of the receptive field (to allow for 
+                    an increased batch size)
             -if false, model will perform 'same' padding convolutions
                 -useful for scenerios like review sentiment analysis 
                     or language transation where it makes sense and 
@@ -193,9 +201,9 @@ def WaveNet(output_dim, residual_filters=64,
                     
                     
         # Set parameters rated to filter size and dilation
-        init_filter_size=3
-        recurrent_filter_size=2
-        init_dilation_rate=2
+        init_filter_size=INIT_FILTER_SIZE
+        recurrent_filter_size=RECUR_FILTER_SIZE
+        init_dilation_rate=DILATION_EXP_BASE
         
         if regressor:
             padding='causal'
@@ -222,7 +230,7 @@ def WaveNet(output_dim, residual_filters=64,
         cur_filters = residual_filters
         downsize_iters = int(dilation_steps * math.ceil(dilation_blocks / 4))
         
-        for i in range(0, (dilation_steps * dilation_blocks)):
+        for i in range(dilation_steps * dilation_blocks):
             # Perform WaveNet block
             input_tensors[0] = out
             out, skip = WaveNetBlock(cur_filters, recurrent_filter_size, 
@@ -289,15 +297,15 @@ def WaveNet(output_dim, residual_filters=64,
 #############   MAIN ROUTINE   #############	
 if __name__ == '__main__':        
     # Model parameters
-    USE_CHAR_VERSION=False
+    USE_CHAR_VERSION=True
     
     if USE_CHAR_VERSION:
         time_steps = 2500
         top_words = None
         total_options = ds_utils.get_total_possible_chars()
         
-        input_dim = 4
-        hidden_dim = 16
+        input_dim = 16
+        hidden_dim = 24
         output_dim = 2
 
         dilation_steps = 5
@@ -316,6 +324,19 @@ if __name__ == '__main__':
         dilation_blocks = 6
         
         
+    # Print receptive field based on parameters above
+    filters = [ INIT_FILTER_SIZE ]
+    recurrent_filters = [ RECUR_FILTER_SIZE ] * (dilation_steps * dilation_blocks)
+    filters.extend(recurrent_filters)
+    
+    dilation_rates = [ 0 ]
+    for i in range(dilation_steps * dilation_blocks):
+        dilation_rates.append(math.pow(DILATION_EXP_BASE, (i % dilation_steps)))
+        
+    final_layer_rf = gen_utils.get_effective_receptive_field(filters, dilation_rates)
+    print("The receptive field of the final layer of current model is:  %d\n" % final_layer_rf)
+    
+    
     # Get IMDB training/test dataset
     (X_train, y_train), (X_test, y_test) = imdb.load_data(num_words=top_words)
 
@@ -328,17 +349,17 @@ if __name__ == '__main__':
         X_test = ds_utils.convert_word_dataset_to_char_dataset(X_test, sorted_keys)    
 
 
-    # Truncate and pad input sequences (depending on length)
+    # Truncate and pre-pad (e.g to the left) input sequences (depending on length)
     max_review_length = time_steps
     X_train = sequence.pad_sequences(X_train, maxlen=max_review_length)
     X_test = sequence.pad_sequences(X_test, maxlen=max_review_length)
 
+    print(y_train.shape)
     y_train = to_categorical(y_train, output_dim)
     y_test = to_categorical(y_test, output_dim)
-
-    print(X_train.shape, X_train[0].dtype, X_train[0][-100:])
-    print(X_test.shape, X_test[0].dtype, X_test[0][-100:])
     
+    print(y_train.shape)
+    quit()
     
     # Set-up input embedding for all RNN models
     input = Input((time_steps, ))
@@ -371,11 +392,11 @@ if __name__ == '__main__':
     # Begin training
     num_epochs=8
     batch_size=8
-    percent_val=1.0
-
     
+    percent_val = 1.0
     num_examples = X_train.shape[0]
     train_subsection_i = int(batch_size * ((num_examples * percent_val) // batch_size))
+
     
     model.fit(X_train[:train_subsection_i], y_train[:train_subsection_i], 
                     epochs=num_epochs, batch_size=batch_size)
