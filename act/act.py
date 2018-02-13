@@ -613,7 +613,7 @@ class ACT_Cell(Recurrent):
         
         
         # Call loop layer
-        looper = dl_layers.loop_layer(cond_func, step_func)
+        looper = act_layers.act_loop_layer(cond_func, step_func)
         loop_inputs = [ inputs, new_input_flag, acclum_output, 
                         s_cur, acclum_state,
                         prob, counter, counter_condition,
