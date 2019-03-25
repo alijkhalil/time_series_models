@@ -1,5 +1,5 @@
 # Import statements
-import sys
+import sys, os
 import numpy as np
 import tensorflow as tf
 
@@ -21,9 +21,11 @@ from keras.regularizers import l2
 from keras.legacy import interfaces
 from keras.layers.core import Activation
 
-sys.path.append("..")
-from dl_utilities.layers import act as act_layers
-from dl_utilities.layers import general as dl_layers
+dir_path = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(dir_path + "/../../")
+
+from dl_utilities.layers import act as act_layers  # Requires 'sys.path.append' call above
+from dl_utilities.layers import general as dl_layers  # Requires 'sys.path.append' call above
 
 
 # Global variables

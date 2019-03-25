@@ -26,12 +26,12 @@ from keras.layers.normalization import BatchNormalization
 from keras.regularizers import l2
 from keras.layers.core import Activation
 
+dir_path = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(dir_path + "/../../")
 
-sys.path.append("..")
-from dl_utilities.datasets import dataset_utils as ds_utils
-from dl_utilities.general import general as gen_utils
-from dl_utilities.bytenet import bytenet_utils as bn_utils
-
+from dl_utilities.datasets import dataset_utils as ds_utils  # Requires 'sys.path.append' call above
+from dl_utilities.general import general as gen_utils  # Requires 'sys.path.append' call above
+from dl_utilities.bytenet import bytenet_utils as bn_utils  # Requires 'sys.path.append' call above
 
 
 DEFAULT_WEIGHT_DECAY=1E-4

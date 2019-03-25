@@ -1,6 +1,5 @@
 # Import statements
-import sys, argparse
-sys.path.append("..")
+import sys, argparse, os
 
 import tensorflow as tf
 import numpy as np
@@ -23,7 +22,7 @@ from rhn import rhn
 from act import act
 from custom_rnns import custom_rhn, stacked_gru
 
-from dl_utilities.layers import custom_loss as loss_layers
+from dl_utilities.layers import custom_loss as loss_layers  # Only works bc importing 'custom_rhn' includes a 'sys.path.append' call 
 
 
 

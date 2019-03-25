@@ -1,5 +1,5 @@
 # Import statements
-import sys
+import sys, os
 import numpy as np
 
 from keras import backend as K
@@ -21,8 +21,10 @@ from keras.legacy import interfaces
 from keras.optimizers import SGD, Adam
 from keras.layers.core import Activation
 
-sys.path.append("..")
-from dl_utilities.layers import general as dl_layers
+dir_path = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(dir_path + "/../../")
+
+from dl_utilities.layers import general as dl_layers  # Requires 'sys.path' call above
 
 
 # Global variables

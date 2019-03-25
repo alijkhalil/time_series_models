@@ -2,7 +2,7 @@ from __future__ import print_function
 from __future__ import absolute_import
 from __future__ import division
 
-import sys, warnings, math
+import sys, warnings, math, os
 import operator
 
 import numpy as np
@@ -23,9 +23,11 @@ from keras.layers.normalization import BatchNormalization
 from keras.regularizers import l2
 from keras.layers.core import Activation
 
-sys.path.append("..")
-from dl_utilities.datasets import dataset_utils as ds_utils
-from dl_utilities.general import general as gen_utils
+dir_path = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(dir_path + "/../../")      
+
+from dl_utilities.datasets import dataset_utils as ds_utils  # Requires 'sys.path' call above
+from dl_utilities.general import general as gen_utils  # Requires 'sys.path' call above
 
 
 DEFAULT_WEIGHT_DECAY=1E-4
